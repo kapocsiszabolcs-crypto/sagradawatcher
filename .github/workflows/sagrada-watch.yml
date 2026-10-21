@@ -1,0 +1,38 @@
+name: sagrada-watch
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 10 percenként (a GitHub néha késik)
+  workflow_dispatch:          # kézi indítás gombbal
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Playwright telepítése
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Jegyek ellenőrzése
+        run: python sagrada_watch_ci.py
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+
+      - name: Képernyőkép mentése (hibakereséshez)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: |
+            debug.png
+            debug.html
