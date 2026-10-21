@@ -1,94 +1,219 @@
 #!/usr/bin/env python3
-"""Egyszeri ellenőrzés (GitHub Actions-höz). Ha nov. 3-6. között van szabad nap, e-mailt küld.
-Titkos adatok környezeti változókból (GitHub Secrets): SMTP_USER, SMTP_PASS, MAIL_TO
+"""Sagrada Família jegyfigyelő GitHub Actions-höz.
+
+A célhónap megjelenésekor megvizsgálja a megadott napokat, és csak akkor
+küld e-mailt, ha a naptárban elérhetőnek látszó napot talál.
+
+GitHub Secrets szükséges:
+  SMTP_USER, SMTP_PASS, MAIL_TO
 """
 import os
 import re
 import smtplib
 from email.message import EmailMessage
+from pathlib import Path
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 URL = "https://tickets.sagradafamilia.org/en/1-individual/4375-sagrada-familia"
 TARGET_MONTH = "November"
 TARGET_DAYS = {3, 4, 5, 6}
 
-# --- Ha nem találja a naptárat, ezeket kell hangolni ---
+NAVIGATION_TIMEOUT_MS = 60_000
+CALENDAR_WAIT_MS = 5_000
+DEBUG_SCREENSHOT = Path("debug.png")
+DEBUG_HTML = Path("debug.html")
+
 DAY_SELECTOR = "[class*='day'], [role='gridcell'], td button, td"
-NEXT_MONTH_SELECTOR = "button[aria-label*='next' i], [class*='next' i]"
-DISABLED_HINTS = ("disabled", "sold", "unavailable", "soldout", "no-avail", "outside")
-# -------------------------------------------------------
+NEXT_MONTH_SELECTOR = 'button[aria-label*="next" i], [class*="next" i]'
+DISABLED_HINTS = (
+    "disabled", "sold", "unavailable", "soldout", "no-avail",
+    "outside", "unbookable",
+)
+
+
+def save_debug(page):
+    """Hibakeresési fájlok mentése; a sikertelen oldal is vizsgálható legyen."""
+    try:
+        page.screenshot(path=str(DEBUG_SCREENSHOT), full_page=True, timeout=15_000)
+        print(f"Képernyőkép mentve: {DEBUG_SCREENSHOT}")
+    except Exception as exc:
+        print(f"A képernyőkép mentése nem sikerült: {exc}")
+
+    try:
+        DEBUG_HTML.write_text(page.content(), encoding="utf-8")
+        print(f"HTML mentve: {DEBUG_HTML}")
+    except Exception as exc:
+        print(f"A HTML mentése nem sikerült: {exc}")
 
 
 def send_email(days):
-    user, pwd, to = os.environ["SMTP_USER"], os.environ["SMTP_PASS"], os.environ["MAIL_TO"]
+    user = os.environ.get("SMTP_USER")
+    pwd = os.environ.get("SMTP_PASS")
+    to = os.environ.get("MAIL_TO")
+    missing = [name for name, value in (
+        ("SMTP_USER", user), ("SMTP_PASS", pwd), ("MAIL_TO", to)
+    ) if not value]
+    if missing:
+        raise RuntimeError(
+            "Hiányzó GitHub Secrets / környezeti változók: " + ", ".join(missing)
+        )
+
     msg = EmailMessage()
-    msg["Subject"] = f"Sagrada Familia: szabad nap novemberben: {sorted(days)}"
-    msg["From"], msg["To"] = user, to
-    msg.set_content(f"Felszabadult hely! Foglalj most:\n{URL}")
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-        s.login(user, pwd)
-        s.send_message(msg)
-    print("E-mail elküldve.")
+    msg["Subject"] = f"Sagrada Familia: lehetséges szabad nap novemberben: {sorted(days)}"
+    msg["From"] = user
+    msg["To"] = to
+    msg.set_content(
+        "A jegyoldal naptárában elérhetőnek látszó nap(ok): "
+        f"{', '.join(map(str, sorted(days)))}\n\n"
+        "Kérlek, ellenőrizd a foglalási oldalon, mert a naptár felépítése "
+        "változhat, és az automatikus ellenőrzés tévedhet:\n"
+        f"{URL}\n"
+    )
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+        smtp.login(user, pwd)
+        smtp.send_message(msg)
+    print("Értesítő e-mail elküldve.")
 
 
 def main():
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        page = browser.new_context(
+        context = browser.new_context(
             locale="en-US",
             viewport={"width": 1280, "height": 1600},
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-        ).new_page()
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
+        page.set_default_timeout(10_000)
+
         try:
-            # A "networkidle" itt sosem teljesült, ezért elég a DOM betöltése
-            page.goto(URL, wait_until="domcontentloaded", timeout=90000)
-        except Exception as e:
-            print("Betöltési hiba (folytatom, hogy legyen képernyőkép):", e)
-        page.wait_for_timeout(8000)
-        for label in ("Accept all", "Accept", "Aceptar", "OK"):
-            try:
-                page.get_by_role("button", name=re.compile(label, re.I)).first.click(timeout=2000)
-                break
-            except Exception:
-                pass
-        page.wait_for_timeout(3000)
+            response = None
+            last_error = None
 
-        for _ in range(4):
-            if TARGET_MONTH.lower() in page.inner_text("body").lower():
-                break
-            try:
-                page.locator(NEXT_MONTH_SELECTOR).first.click(timeout=3000)
-                page.wait_for_timeout(1000)
-            except Exception:
-                break
+            # A networkidle helyett DOMContentLoaded: a foglalási oldalon
+            # a háttérben folyamatos hálózati kérések futhatnak.
+            for attempt in range(1, 3):
+                try:
+                    print(f"Oldalbetöltés ({attempt}/2): {URL}")
+                    response = page.goto(
+                        URL,
+                        wait_until="domcontentloaded",
+                        timeout=NAVIGATION_TIMEOUT_MS,
+                    )
+                    last_error = None
+                    break
+                except PlaywrightTimeoutError as exc:
+                    last_error = exc
+                    print(f"Navigációs timeout ({attempt}/2): {exc}")
+                    if attempt < 2:
+                        try:
+                            page.goto(
+                                "about:blank",
+                                wait_until="load",
+                                timeout=10_000,
+                            )
+                        except Exception:
+                            pass
 
-        # Képernyőkép és HTML mentése (a workflow feltölti, telefonról is megnézhető)
-        page.screenshot(path="debug.png", full_page=True)
-        open("debug.html", "w", encoding="utf-8").write(page.content())
+            if last_error is not None:
+                save_debug(page)
+                raise RuntimeError(
+                    "A jegyoldal két próbálkozás után sem töltődött be. "
+                    "A debug.png és debug.html fájlokat nézd meg az Actions artifactban."
+                ) from last_error
 
-        found = set()
-        for el in page.locator(DAY_SELECTOR).all():
-            try:
-                text = (el.inner_text(timeout=1000) or "").strip()
-            except Exception:
-                continue
-            m = re.match(r"^(\d{1,2})\b", text)
-            if not m or int(m.group(1)) not in TARGET_DAYS:
-                continue
-            attrs = " ".join(filter(None, [
-                el.get_attribute("class"),
-                "disabled" if el.get_attribute("disabled") is not None else "",
-                "disabled" if el.get_attribute("aria-disabled") == "true" else "",
-            ])).lower()
-            if not any(h in attrs for h in DISABLED_HINTS):
-                found.add(int(m.group(1)))
-        browser.close()
+            if response is not None:
+                print(f"HTTP státuszkód: {response.status}")
+                if response.status >= 400:
+                    save_debug(page)
+                    raise RuntimeError(f"A jegyoldal HTTP {response.status} hibát adott.")
 
-    print("Szabad napok:", sorted(found) or "nincs")
+            page.wait_for_timeout(CALENDAR_WAIT_MS)
+
+            # Cookie-ablak elfogadása, ha megjelenik.
+            for label in ("Accept all", "Accept", "Aceptar", "OK"):
+                try:
+                    page.get_by_role("button", name=re.compile(label, re.I)).first.click(
+                        timeout=1_500
+                    )
+                    print(f"Cookie-ablak kezelve: {label}")
+                    break
+                except Exception:
+                    continue
+
+            page.wait_for_timeout(2_000)
+
+            # Legfeljebb négy lépésben keressük a célhónapot.
+            month_found = False
+            for _ in range(5):
+                body_text = page.locator("body").inner_text(timeout=10_000)
+                if TARGET_MONTH.casefold() in body_text.casefold():
+                    month_found = True
+                    break
+                try:
+                    next_button = page.locator(NEXT_MONTH_SELECTOR).first
+                    if next_button.count() == 0:
+                        break
+                    next_button.click(timeout=3_000)
+                    page.wait_for_timeout(1_000)
+                except Exception:
+                    break
+
+            if not month_found:
+                save_debug(page)
+                raise RuntimeError(
+                    f"A(z) {TARGET_MONTH} hónapot nem találtam az oldalon. "
+                    "Nem küldök értesítést, mert a naptár nem ellenőrizhető."
+                )
+
+            # A ténylegesen megjelenített oldalról mentjük a hibakeresési adatokat.
+            save_debug(page)
+
+            found = set()
+            for element in page.locator(DAY_SELECTOR).all():
+                try:
+                    text = (element.inner_text(timeout=1_000) or "").strip()
+                    match = re.match(r"^(\d{1,2})\b", text)
+                    if not match:
+                        continue
+
+                    day = int(match.group(1))
+                    if day not in TARGET_DAYS:
+                        continue
+
+                    classes = element.get_attribute("class") or ""
+                    aria_disabled = element.get_attribute("aria-disabled") == "true"
+                    disabled_attr = element.get_attribute("disabled") is not None
+                    attrs = classes.lower()
+
+                    if aria_disabled or disabled_attr:
+                        continue
+                    if any(hint in attrs for hint in DISABLED_HINTS):
+                        continue
+
+                    # Csak a látható elemeket vesszük figyelembe.
+                    if not element.is_visible():
+                        continue
+
+                    found.add(day)
+                except Exception:
+                    continue
+
+        finally:
+            browser.close()
+
+    print("Lehetséges szabad napok:", sorted(found) if found else "nincs")
     if found:
         send_email(found)
+    else:
+        print("Nem találtam elérhetőnek látszó cél-napot; e-mail nem ment ki.")
 
 
 if __name__ == "__main__":
