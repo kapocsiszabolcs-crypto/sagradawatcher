@@ -12,7 +12,7 @@ from playwright.sync_api import sync_playwright
 
 URL = "https://tickets.sagradafamilia.org/en/1-individual/4375-sagrada-familia"
 TARGET_MONTH = "November 2026"  # Hónap és év a pontos beazonosításhoz
-TARGET_DAYS = {3, 4, 5, 6,11}
+TARGET_DAYS = {3, 4, 5, 6}
 
 NAVIGATION_TIMEOUT_MS = 60_000
 CALENDAR_WAIT_MS = 5_000
