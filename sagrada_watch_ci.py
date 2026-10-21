@@ -35,8 +35,18 @@ def send_email(days):
 def main():
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        page = browser.new_context(locale="en-US", viewport={"width": 1280, "height": 1600}).new_page()
-        page.goto(URL, wait_until="networkidle", timeout=60000)
+        page = browser.new_context(
+            locale="en-US",
+            viewport={"width": 1280, "height": 1600},
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        ).new_page()
+        try:
+            # A "networkidle" itt sosem teljesült, ezért elég a DOM betöltése
+            page.goto(URL, wait_until="domcontentloaded", timeout=90000)
+        except Exception as e:
+            print("Betöltési hiba (folytatom, hogy legyen képernyőkép):", e)
+        page.wait_for_timeout(8000)
         for label in ("Accept all", "Accept", "Aceptar", "OK"):
             try:
                 page.get_by_role("button", name=re.compile(label, re.I)).first.click(timeout=2000)
