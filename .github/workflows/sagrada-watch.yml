@@ -2,7 +2,7 @@ name: sagrada-watch
 
 on:
   schedule:
-    - cron: "*/5 * * * *" # 10 percenként; a GitHub ütemezése késhet
+    - cron: "*/2 * * * *" # 10 percenként; a GitHub ütemezése késhet
   workflow_dispatch:
 
 permissions:
